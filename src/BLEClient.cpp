@@ -54,6 +54,21 @@ BLEClient::BLEClient() {
 	m_gattc_if         = ESP_GATT_IF_NONE;
 	m_haveServices     = false;
 	m_isConnected      = false;  // Initially, we are flagged as not connected.
+
+
+	m_appId = BLEDevice::m_appId++;
+	m_appId = m_appId%100;
+	BLEDevice::addPeerDevice(this, true, m_appId);
+	m_semaphoreRegEvt.take("connect");
+
+	esp_err_t errRc = ::esp_ble_gattc_app_register(m_appId);
+	if (errRc != ESP_OK) {
+		ESP_LOGE(LOG_TAG, "esp_ble_gattc_app_register: rc=%d %s", errRc, GeneralUtils::errorToString(errRc));
+		return;
+	}
+
+	m_semaphoreRegEvt.wait("connect");
+
 } // BLEClient
 
 
@@ -63,10 +78,10 @@ BLEClient::BLEClient() {
 BLEClient::~BLEClient() {
 	// We may have allocated service references associated with this client.  Before we are finished
 	// with the client, we must release resources.
-	for (auto &myPair : m_servicesMap) {
-	   delete myPair.second;
-	}
-	m_servicesMap.clear();
+	clearServices();
+	esp_ble_gattc_app_unregister(m_gattc_if);
+	BLEDevice::removePeerDevice(m_appId, true);
+
 } // ~BLEClient
 
 
@@ -81,6 +96,7 @@ void BLEClient::clearServices() {
 	   delete myPair.second;
 	}
 	m_servicesMap.clear();
+	m_servicesMapByInstID.clear();
 	m_haveServices = false;
 	ESP_LOGD(LOG_TAG, "<< clearServices");
 } // clearServices
@@ -102,26 +118,11 @@ bool BLEClient::connect(BLEAdvertisedDevice* device) {
 bool BLEClient::connect(BLEAddress address, esp_ble_addr_type_t type) {
 	ESP_LOGD(LOG_TAG, ">> connect(%s)", address.toString().c_str());
 
-// We need the connection handle that we get from registering the application.  We register the app
-// and then block on its completion.  When the event has arrived, we will have the handle.
-	m_appId = BLEDevice::m_appId++;
-	BLEDevice::addPeerDevice(this, true, m_appId);
-	m_semaphoreRegEvt.take("connect");
-
-	// clearServices(); // we dont need to delete services since every client is unique?
-	esp_err_t errRc = ::esp_ble_gattc_app_register(m_appId);
-	if (errRc != ESP_OK) {
-		ESP_LOGE(LOG_TAG, "esp_ble_gattc_app_register: rc=%d %s", errRc, GeneralUtils::errorToString(errRc));
-		return false;
-	}
-
-	m_semaphoreRegEvt.wait("connect");
-
 	m_peerAddress = address;
 
 	// Perform the open connection request against the target BLE Server.
 	m_semaphoreOpenEvt.take("connect");
-	errRc = ::esp_ble_gattc_open(
+	esp_err_t errRc = ::esp_ble_gattc_open(
 		m_gattc_if,
 		*getPeerAddress().getNative(), // address
 		type,          // Note: This was added on 2018-04-03 when the latest ESP-IDF was detected to have changed the signature.
@@ -144,6 +145,7 @@ bool BLEClient::connect(BLEAddress address, esp_ble_addr_type_t type) {
  */
 void BLEClient::disconnect() {
 	ESP_LOGD(LOG_TAG, ">> disconnect()");
+	ESP_LOGW(__func__, "gattIf: %d, connId: %d", getGattcIf(), getConnId());
 	esp_err_t errRc = ::esp_ble_gattc_close(getGattcIf(), getConnId());
 	if (errRc != ESP_OK) {
 		ESP_LOGE(LOG_TAG, "esp_ble_gattc_close: rc=%d %s", errRc, GeneralUtils::errorToString(errRc));
@@ -185,17 +187,21 @@ void BLEClient::gattClientEventHandler(
 		// - uint16_t          conn_id
 		// - esp_bd_addr_t     remote_bda
 		case ESP_GATTC_DISCONNECT_EVT: {
-				// If we receive a disconnect event, set the class flag that indicates that we are
-				// no longer connected.
-				m_isConnected = false;
-				if (m_pClientCallbacks != nullptr) {
-					m_pClientCallbacks->onDisconnect(this);
-				}
-				BLEDevice::removePeerDevice(m_appId, true);
-				esp_ble_gattc_app_unregister(m_gattc_if);
-				m_semaphoreRssiCmplEvt.give();
-				m_semaphoreSearchCmplEvt.give(1);
+			if(!m_isConnected)
 				break;
+			// If we receive a disconnect event, set the class flag that indicates that we are
+			// no longer connected.
+			// if(evtParam->disconnect.reason != 0x16){
+				m_semaphoreOpenEvt.give(evtParam->disconnect.reason);
+				esp_ble_gattc_close(m_gattc_if, m_conn_id);
+			// }
+			m_isConnected = false;
+			if (m_pClientCallbacks != nullptr) {
+				m_pClientCallbacks->onDisconnect(this);
+			}
+			// esp_ble_gattc_app_unregister(m_gattc_if);
+			// BLEDevice::removePeerDevice(m_appId, true);
+			break;
 		} // ESP_GATTC_DISCONNECT_EVT
 
 		//
